@@ -13,6 +13,7 @@ AWS Control Tower Account Factory for Terraform (AFT) CLI ツールは、AFTの�
 - **設定管理**: Viper
 - **ログ**: uber-go/zap
 - **テスト**: Go標準テストパッケージ + testify
+- **ビルド・リリース**: GoReleaser
 
 ### 全体アーキテクチャ
 
@@ -24,6 +25,14 @@ graph TB
     CLI --> Custom[Customization Manager]
     CLI --> Validate[Validator]
     CLI --> Dashboard[Dashboard]
+    CLI --> Cache[Cache Manager]
+    
+    Config --> Cache
+    Account --> Cache
+    Pipeline --> Cache
+    Dashboard --> Cache
+    
+    Cache --> Disk[Persistent Storage<br/>JSON Files]
     
     Config --> AWS[AWS SDK Go v2]
     Account --> AWS
@@ -63,6 +72,8 @@ graph TB
 - `aft validate` - 設定検証
 - `aft dashboard` - ダッシュボード表示
 - `aft customization manage` - カスタマイゼーション管理
+- `aft cache clear` - キャッシュクリア
+- `aft cache stats` - キャッシュ統計表示
 - `aft setup` - 初期設定
 - `aft version` - バージョン情報表示
 
@@ -239,6 +250,59 @@ interface Dashboard {
 }
 ```
 
+### 8. Cache Manager
+
+APIレスポンスのキャッシュ管理を行うコンポーネント
+
+```go
+type CacheEntry struct {
+    Key        string      `json:"key"`
+    Data       interface{} `json:"data"`
+    ExpiresAt  time.Time   `json:"expires_at"`
+    CreatedAt  time.Time   `json:"created_at"`
+    AccessedAt time.Time   `json:"accessed_at"`
+    AccessCount int64      `json:"access_count"`
+}
+
+type CacheConfig struct {
+    DefaultTTL    time.Duration `yaml:"default_ttl"`     // デフォルト5分
+    MaxSize       int64         `yaml:"max_size"`        // 最大キャッシュサイズ（MB）
+    CleanupInterval time.Duration `yaml:"cleanup_interval"` // クリーンアップ間隔
+    PersistPath   string        `yaml:"persist_path"`    // 永続化ファイルパス
+    EnabledAPIs   []string      `yaml:"enabled_apis"`    // キャッシュ対象API
+}
+
+type CacheManager interface {
+    Get(key string) (interface{}, bool)
+    Set(key string, data interface{}, ttl time.Duration) error
+    Delete(key string) error
+    Clear() error
+    GetStats() *CacheStats
+    LoadFromDisk() error
+    SaveToDisk() error
+    StartCleanupRoutine() error
+    StopCleanupRoutine() error
+}
+
+type CacheStats struct {
+    TotalEntries   int64         `json:"total_entries"`
+    HitCount       int64         `json:"hit_count"`
+    MissCount      int64         `json:"miss_count"`
+    HitRate        float64       `json:"hit_rate"`
+    TotalSize      int64         `json:"total_size_bytes"`
+    OldestEntry    *time.Time    `json:"oldest_entry,omitempty"`
+    NewestEntry    *time.Time    `json:"newest_entry,omitempty"`
+}
+
+// キャッシュキー生成用のヘルパー
+type CacheKeyBuilder interface {
+    BuildAccountListKey(filters *AccountFilter) string
+    BuildPipelineStatusKey() string
+    BuildAccountStatusKey(accountID string) string
+    BuildConfigKey() string
+}
+```
+
 ## データモデル
 
 ### Account Request Model
@@ -279,6 +343,7 @@ type CLIConfig struct {
     AFTConfig    *AFTConfig   `yaml:"aft_config"`
     OutputFormat OutputFormat `yaml:"output_format"`
     Verbosity    Verbosity    `yaml:"verbosity"`
+    Cache        *CacheConfig `yaml:"cache"`
 }
 ```
 
@@ -355,15 +420,22 @@ func NewAFTError(message, code string, suggestions ...string) *AFTError {
 ## パフォーマンス要件
 
 ### レスポンス時間
-- 設定表示: < 2秒
-- アカウント一覧: < 5秒
-- パイプライン状況: < 3秒
+- 設定表示: < 2秒（キャッシュ有効時 < 0.5秒）
+- アカウント一覧: < 5秒（キャッシュ有効時 < 1秒）
+- パイプライン状況: < 3秒（キャッシュ有効時 < 0.5秒）
 - 検証処理: < 10秒
 
 ### スケーラビリティ
 - 1000アカウント以上の管理対応
 - 並行処理による高速化
 - キャッシュ機能による応答性向上
+- APIコール数削減によるレート制限回避
+
+### キャッシュパフォーマンス
+- キャッシュヒット率: > 70%
+- キャッシュ応答時間: < 100ms
+- メモリ使用量: < 100MB
+- ディスク使用量: < 50MB
 
 ## 運用考慮事項
 
@@ -381,3 +453,6 @@ func NewAFTError(message, code string, suggestions ...string) *AFTError {
 - 自動更新機能
 - バージョン管理
 - 後方互換性の維持
+- GoReleaser による自動リリース
+- クロスプラットフォーム対応（Linux、macOS、Windows）
+- GitHub Releases との統合
